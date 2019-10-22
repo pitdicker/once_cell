@@ -54,11 +54,15 @@ const COMPLETE: usize = 0x2;
 // this is in the RUNNING state.
 const STATE_MASK: usize = 0x3;
 
-// Representation of a node in the linked list of waiters in the RUNNING state.
+// Representation of a node in the linked list of waiters, used while in the
+// RUNNING state.
 struct Waiter {
-    thread: Option<Thread>,
+    thread: Thread,
     signaled: AtomicBool,
-    next: *mut Waiter,
+    next: *const Waiter,
+    // Note: we have to use a raw pointer for `next`. After setting `signaled`
+    // to `true` the next thread may wake up and free its `Waiter`, while we
+    // would still hold a live reference.
 }
 
 // Head of a linked list of waiters.
@@ -164,11 +168,11 @@ fn wait(state_and_queue: &AtomicUsize, current_state: usize) {
     // Create the node for our current thread that we are going to try to slot
     // in at the head of the linked list.
     let mut node = Waiter {
-        thread: Some(thread::current()),
+        thread: thread::current(),
         signaled: AtomicBool::new(false),
-        next: ptr::null_mut(),
+        next: ptr::null(),
     };
-    let me = &mut node as *mut Waiter as usize;
+    let me = &node as *const Waiter as usize;
     assert!(me & STATE_MASK == 0); // We assume pointers have 2 free bits that
                                    // we can use for state.
 
@@ -216,10 +220,10 @@ impl Drop for WaiterQueue<'_> {
         // because right after that the node can be freed if there happens to be
         // a spurious wakeup.
         unsafe {
-            let mut queue = (state_and_queue & !STATE_MASK) as *mut Waiter;
+            let mut queue = (state_and_queue & !STATE_MASK) as *const Waiter;
             while !queue.is_null() {
                 let next = (*queue).next;
-                let thread = (*queue).thread.take().unwrap();
+                let thread = (*queue).thread.clone();
                 (*queue).signaled.store(true, Ordering::SeqCst);
                 thread.unpark();
                 queue = next;
