@@ -10,6 +10,40 @@
 //   * no poisoning
 //   * init function can fail
 //   * thread parking is factored out of `initialize`
+//
+// Atomic orderings:
+// When initializing `OnceCell` we deal with multiple atomics:
+// `OnceCell.state_and_queue` and an unknown number of `Waiter.signaled`.
+// * `state_and_queue` is used (1) as a state flag, (2) for synchronizing the
+//   data in `OnceCell.value`, and (3) for synchronizing `Waiter` nodes.
+//     - At the end of the `initialize_inner` function we have to make sure
+//      `OnceCell.value` is acquired. So every load which can be the only one to
+//       load COMPLETED must have at least Acquire ordering, which means all
+//       three of them.
+//     - `WaiterQueue::Drop` is the only place that stores COMPLETED, and must
+//       do so with Release ordering to make `OnceCell.value` available.
+//     - `wait` inserts `Waiter` nodes as a pointer in `state_and_queue`, and
+//       needs to make the nodes available with Release ordering. The load in
+//       its `compare_and_swap` can be Relaxed because it only has to compare
+//       the atomic, not to read other data.
+//     - `WaiterQueue::Drop` must see the `Waiter` nodes, so it must load
+//       `state_and_queue` with Acquire ordering.
+//     - There is just one store where `state_and_queue` is used only as a
+//       state flag, without having to synchronize data: switching the state
+//       from EMPTY to RUNNING in `initialize_inner`. This store can be Relaxed,
+//       but the read has to be Acquire because of the requirements mentioned
+//       above.
+// * `Waiter.signaled` is only used as a flag, and does not have to synchronize
+//    data. It can be stored and loaded with Relaxed ordering.
+// * There is one place where the two atomics `OnceCell.state_and_queue` and
+//   `Waiter.signaled` come together, and may be reordered by the compiler or
+//   processor. When `wait` loads `signaled` and returns when true,
+//   `initialize_inner` continues with a load on `state_and_queue`. If they are
+//   reordered `state_and_queue` might still return the old state from before
+//   the thread got parked. Both have to use SeqCst ordering. It is possible for
+//   `signaled` to be set and for `wait` to return before parking the thread, so
+//   even if `park`/`unpark` would form some sort of barrier, that would not be
+//   enough.
 
 use std::{
     cell::UnsafeCell,
@@ -81,7 +115,7 @@ impl<T> OnceCell<T> {
         }
     }
 
-    /// Safety: synchronizes with store to value via Release/(Acquire|SeqCst).
+    /// Safety: synchronizes with store to value via Release/Acquire.
     #[inline]
     pub(crate) fn is_initialized(&self) -> bool {
         // An `Acquire` load is enough because that makes all the initialization
@@ -90,7 +124,7 @@ impl<T> OnceCell<T> {
         self.state_and_queue.load(Ordering::Acquire) == COMPLETE
     }
 
-    /// Safety: synchronizes with store to value via SeqCst.
+    /// Safety: synchronizes with store to value via Release/Acquire.
     /// Writes value only once because we never get to INCOMPLETE state after a
     /// successful write.
     #[cold]
@@ -128,16 +162,13 @@ impl<T> OnceCell<T> {
 // currently no way to take an `FnOnce` and call it via virtual dispatch
 // without some allocation overhead.
 fn initialize_inner(state: &AtomicUsize, init: &mut dyn FnMut() -> bool) {
-    // This cold path uses SeqCst consistently because the
-    // performance difference really does not matter there, and
-    // SeqCst minimizes the chances of something going wrong.
-    let mut state_and_queue = state.load(Ordering::SeqCst);
+    let mut state_and_queue = state.load(Ordering::Acquire);
     loop {
         match state_and_queue {
             COMPLETE => break,
             EMPTY => {
                 // Try to register this thread as the one doing initialization (RUNNING).
-                let old = state.compare_and_swap(EMPTY, RUNNING, Ordering::SeqCst);
+                let old = state.compare_and_swap(EMPTY, RUNNING, Ordering::Acquire);
                 if old != EMPTY {
                     state_and_queue = old;
                     continue
@@ -158,6 +189,8 @@ fn initialize_inner(state: &AtomicUsize, init: &mut dyn FnMut() -> bool) {
                 // pointer to the waiter queue in the more significant bits.
                 assert!(state_and_queue & STATE_MASK == RUNNING);
                 wait(&state, state_and_queue);
+                // Load with SeqCst instead of Acquire to prevent reordering
+                // with the previous load on `Waiter.signaled` in `wait()`.
                 state_and_queue = state.load(Ordering::SeqCst);
             }
         }
@@ -188,7 +221,7 @@ fn wait(state_and_queue: &AtomicUsize, current_state: usize) {
         node.next = (old_head_and_status & !STATE_MASK) as *mut Waiter;
         let old = state_and_queue.compare_and_swap(old_head_and_status,
                                                    me | RUNNING,
-                                                   Ordering::SeqCst);
+                                                   Ordering::Release);
         if old == old_head_and_status {
             break; // Success!
         }
@@ -200,6 +233,9 @@ fn wait(state_and_queue: &AtomicUsize, current_state: usize) {
     // drop our `Waiter` node and leave a hole in the linked list (and a
     // dangling reference). Guard against spurious wakeups by reparking
     // ourselves until we are signaled.
+    //
+    // Load with SeqCst instead of Relaxed to prevent reordering with the
+    // following load on `OnceCell.state_and_queue` in `wait()`.
     while !node.signaled.load(Ordering::SeqCst) {
         thread::park();
     }
@@ -209,7 +245,7 @@ impl Drop for WaiterQueue<'_> {
     fn drop(&mut self) {
         // Swap out our state with however we finished.
         let state_and_queue = self.state_and_queue.swap(self.set_state_on_drop_to,
-                                                        Ordering::SeqCst);
+                                                        Ordering::AcqRel);
 
         // We should only ever see an old state which was RUNNING.
         assert_eq!(state_and_queue & STATE_MASK, RUNNING);
@@ -224,7 +260,7 @@ impl Drop for WaiterQueue<'_> {
             while !queue.is_null() {
                 let next = (*queue).next;
                 let thread = (*queue).thread.clone();
-                (*queue).signaled.store(true, Ordering::SeqCst);
+                (*queue).signaled.store(true, Ordering::Relaxed);
                 thread.unpark();
                 queue = next;
             }
