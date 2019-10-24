@@ -46,10 +46,8 @@
 //   enough.
 
 use std::{
-    cell::UnsafeCell,
-    marker::PhantomData,
+    cell::{Cell, UnsafeCell},
     panic::{RefUnwindSafe, UnwindSafe},
-    ptr,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     thread::{self, Thread},
 };
@@ -57,9 +55,8 @@ use std::{
 #[derive(Debug)]
 pub(crate) struct OnceCell<T> {
     // `state_and_queue` is actually an a pointer to a `Waiter` with extra state
-    // bits, so we add the `PhantomData` appropriately.
+    // bits.
     state_and_queue: AtomicUsize,
-    _marker: PhantomData<*mut Waiter>,
     // FIXME: switch to `std::mem::MaybeUninit` once we are ready to bump MSRV
     // that far. It was stabilized in 1.36.0, so, if you are reading this and
     // it's higher than 1.46.0 outside, please send a PR! ;) (and to the same
@@ -90,10 +87,10 @@ const STATE_MASK: usize = 0x3;
 
 // Representation of a node in the linked list of waiters, used while in the
 // RUNNING state.
-struct Waiter {
-    thread: Thread,
+struct Waiter<'a> {
+    thread: Cell<Option<Thread>>,
     signaled: AtomicBool,
-    next: *const Waiter,
+    next: Cell<Option<&'a Waiter<'a>>>,
     // Note: we have to use a raw pointer for `next`. After setting `signaled`
     // to `true` the next thread may wake up and free its `Waiter`, while we
     // would still hold a live reference.
@@ -110,7 +107,6 @@ impl<T> OnceCell<T> {
     pub(crate) const fn new() -> OnceCell<T> {
         OnceCell {
             state_and_queue: AtomicUsize::new(EMPTY),
-            _marker: PhantomData,
             value: UnsafeCell::new(None),
         }
     }
@@ -200,12 +196,12 @@ fn initialize_inner(state: &AtomicUsize, init: &mut dyn FnMut() -> bool) {
 fn wait(state_and_queue: &AtomicUsize, current_state: usize) {
     // Create the node for our current thread that we are going to try to slot
     // in at the head of the linked list.
-    let mut node = Waiter {
-        thread: thread::current(),
+    let node = Waiter {
+        thread: Cell::new(Some(thread::current())),
         signaled: AtomicBool::new(false),
-        next: ptr::null(),
+        next: Cell::new(None),
     };
-    let me = &node as *const Waiter as usize;
+    let me = &node as *const Waiter<'_> as usize;
     assert!(me & STATE_MASK == 0); // We assume pointers have 2 free bits that
                                    // we can use for state.
 
@@ -218,7 +214,9 @@ fn wait(state_and_queue: &AtomicUsize, current_state: usize) {
             return; // No need anymore to enqueue ourselves.
         }
 
-        node.next = (old_head_and_status & !STATE_MASK) as *mut Waiter;
+        unsafe {
+            node.next.set(((old_head_and_status & !STATE_MASK) as *const Waiter<'_>).as_ref())
+        };
         let old = state_and_queue.compare_and_swap(old_head_and_status,
                                                    me | RUNNING,
                                                    Ordering::Release);
@@ -255,15 +253,20 @@ impl Drop for WaiterQueue<'_> {
         // Note that storing `true` in `signaled` must be the last read we do
         // because right after that the node can be freed if there happens to be
         // a spurious wakeup.
-        unsafe {
-            let mut queue = (state_and_queue & !STATE_MASK) as *const Waiter;
-            while !queue.is_null() {
-                let next = (*queue).next;
-                let thread = (*queue).thread.clone();
-                (*queue).signaled.store(true, Ordering::Relaxed);
-                thread.unpark();
-                queue = next;
+        let mut next: Option<&Waiter<'_>> = unsafe {
+            ((state_and_queue & !STATE_MASK) as *const Waiter<'_>).as_ref()
+        };
+        while next.is_some() {
+            // We can consider setting `node.signaled = true` as the end of the
+            // lifetime of `node`.
+            let thread;
+            {
+                let node = next.unwrap();
+                thread = node.thread.replace(None).unwrap();
+                next = node.next.replace(None);
+                node.signaled.store(true, Ordering::SeqCst);
             }
+            thread.unpark();
         }
     }
 }
