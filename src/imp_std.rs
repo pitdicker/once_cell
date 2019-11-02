@@ -5,13 +5,13 @@
 
 use std::{
     cell::UnsafeCell,
-    mem::MaybeUninit,
     marker::PhantomData,
     panic::{RefUnwindSafe, UnwindSafe},
     ptr,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     thread::{self, Thread},
 };
+use crate::maybe_uninit::MaybeUninit;
 
 pub(crate) struct OnceCell<T> {
     // This `state` word is actually an encoded version of just a pointer to a
@@ -92,7 +92,8 @@ impl<T> OnceCell<T> {
                 Ok(value) => {
                     unsafe {
                         let slot: &mut MaybeUninit<T> = &mut *slot.get();
-                        slot.as_mut_ptr().write(value);
+                        // FIXME: replace with `slot.as_mut_ptr().write(value)`
+                        slot.write(value);
                     }
                     true
                 }
