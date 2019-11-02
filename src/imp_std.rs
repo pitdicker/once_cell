@@ -5,6 +5,7 @@
 
 use std::{
     cell::UnsafeCell,
+    mem::MaybeUninit,
     marker::PhantomData,
     panic::{RefUnwindSafe, UnwindSafe},
     ptr,
@@ -12,17 +13,12 @@ use std::{
     thread::{self, Thread},
 };
 
-#[derive(Debug)]
 pub(crate) struct OnceCell<T> {
     // This `state` word is actually an encoded version of just a pointer to a
     // `Waiter`, so we add the `PhantomData` appropriately.
     state: AtomicUsize,
     _marker: PhantomData<*mut Waiter>,
-    // FIXME: switch to `std::mem::MaybeUninit` once we are ready to bump MSRV
-    // that far. It was stabilized in 1.36.0, so, if you are reading this and
-    // it's higher than 1.46.0 outside, please send a PR! ;) (and to the same
-    // for `Lazy`, while we are at it).
-    pub(crate) value: UnsafeCell<Option<T>>,
+    pub(crate) value: UnsafeCell<MaybeUninit<T>>,
 }
 
 // Why do we need `T: Send`?
@@ -65,7 +61,7 @@ impl<T> OnceCell<T> {
         OnceCell {
             state: AtomicUsize::new(INCOMPLETE),
             _marker: PhantomData,
-            value: UnsafeCell::new(None),
+            value: UnsafeCell::new(MaybeUninit::uninit()),
         }
     }
 
@@ -94,7 +90,10 @@ impl<T> OnceCell<T> {
             let f = f.take().unwrap();
             match f() {
                 Ok(value) => {
-                    unsafe { *slot.get() = Some(value) };
+                    unsafe {
+                        let slot: &mut MaybeUninit<T> = &mut *slot.get();
+                        slot.as_mut_ptr().write(value);
+                    }
                     true
                 }
                 Err(e) => {

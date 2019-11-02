@@ -560,7 +560,12 @@ pub mod unsync {
 
 #[cfg(feature = "std")]
 pub mod sync {
-    use std::{cell::Cell, fmt, hint::unreachable_unchecked, panic::RefUnwindSafe};
+    use std::{
+        cell::Cell,
+        fmt,
+        mem::MaybeUninit,
+        panic::RefUnwindSafe
+    };
 
     use crate::imp::OnceCell as Imp;
 
@@ -657,7 +662,11 @@ pub mod sync {
         /// Returns `None` if the cell is empty.
         pub fn get_mut(&mut self) -> Option<&mut T> {
             // Safe b/c we have a unique access.
-            unsafe { &mut *self.0.value.get() }.as_mut()
+            if self.0.is_initialized() {
+                Some(unsafe { &mut *(*self.0.value.get()).as_mut_ptr() })
+            } else {
+                None
+            }
         }
 
         /// Get the reference to the underlying value, without checking if the
@@ -669,15 +678,8 @@ pub mod sync {
         /// the contents are acquired by (synchronized to) this thread.
         pub unsafe fn get_unchecked(&self) -> &T {
             debug_assert!(self.0.is_initialized());
-            let slot: &Option<T> = &*self.0.value.get();
-            match slot {
-                Some(value) => value,
-                // This unsafe does improve performance, see `examples/bench`.
-                None => {
-                    debug_assert!(false);
-                    unreachable_unchecked()
-                }
-            }
+            let slot: &MaybeUninit<T> = &*self.0.value.get();
+            &*slot.as_ptr()
         }
 
         /// Sets the contents of this cell to `value`.
@@ -807,7 +809,13 @@ pub mod sync {
         pub fn into_inner(self) -> Option<T> {
             // Because `into_inner` takes `self` by value, the compiler statically verifies
             // that it is not currently borrowed. So it is safe to move out `Option<T>`.
-            self.0.value.into_inner()
+            if self.0.is_initialized() {
+                unsafe {
+                    Some(self.0.value.into_inner().assume_init())
+                }
+            } else {
+                None
+            }
         }
     }
 
@@ -845,6 +853,7 @@ pub mod sync {
     /// ```
     pub struct Lazy<T, F = fn() -> T> {
         cell: OnceCell<T>,
+        // FIXME: replace with MaybeUninit
         init: Cell<Option<F>>,
     }
 
