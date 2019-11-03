@@ -10,14 +10,44 @@
 /// - `as_mut_ptr()` can't be used to initialize the `MaybeUninit`.
 
 #[cfg(maybe_uninit)]
-pub use core::mem::MaybeUninit;
+pub struct MaybeUninit<T>(core::mem::MaybeUninit);
 
-#[cfg(not(maybe_uninit))]
-use core::hint::unreachable_unchecked;
+#[cfg(maybe_uninit)]
+impl<T> MaybeUninit<T> {
+    #[inline]
+    pub const fn uninit() -> MaybeUninit<T> {
+        MaybeUninit(core::mem::MaybeUninit::uninit())
+    }
+
+    #[inline]
+    pub fn as_ptr(&self) -> *const T {
+        self.0.as_ptr()
+    }
+
+    #[inline]
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.0.as_mut_ptr()
+    }
+
+    // Emulate `write`, which is only available on nightly.
+    #[inline]
+    pub fn write(&mut self, val: T) -> &mut T {
+        let slot = self.0.as_mut_ptr();
+        slot.write(value);
+        &mut *slot
+    }
+
+    #[inline]
+    pub unsafe fn assume_init(self) -> T {
+        self.0.assume_init()
+    }
+}
+
 
 #[cfg(not(maybe_uninit))]
 pub struct MaybeUninit<T>(Option<T>);
 
+#[cfg(not(maybe_uninit))]
 impl<T> MaybeUninit<T> {
     #[inline]
     pub const fn uninit() -> MaybeUninit<T> {
@@ -31,7 +61,7 @@ impl<T> MaybeUninit<T> {
             None => {
                 // This unsafe does improve performance, see `examples/bench`.
                 debug_assert!(false);
-                unsafe { unreachable_unchecked() }
+                unsafe { core::hint::unreachable_unchecked() }
             }
         }
     }
