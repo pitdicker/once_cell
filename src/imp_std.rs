@@ -92,7 +92,7 @@ impl<T> OnceCell<T> {
     /// writes value only once because we never get to INCOMPLETE state after a
     /// successful write.
     #[cold]
-    pub(crate) fn initialize<F, E>(&self, f: F) -> Result<(), E>
+    pub(crate) fn initialize<F, E>(&self, f: F) -> Result<&T, E>
     where
         F: FnOnce() -> Result<T, E>,
     {
@@ -116,7 +116,13 @@ impl<T> OnceCell<T> {
                 }
             }
         });
-        res
+        res?;
+        unsafe {
+            let _acquire = self.state.load(Ordering::Acquire);
+            debug_assert!(_acquire == COMPLETE);
+            let slot: &MaybeUninit<T> = &*self.value.get();
+            Ok(&*slot.as_ptr())
+        }
     }
 }
 
