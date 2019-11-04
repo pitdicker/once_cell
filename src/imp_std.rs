@@ -6,6 +6,7 @@
 use std::{
     cell::{Cell, UnsafeCell},
     marker::PhantomData,
+    mem::ManuallyDrop,
     panic::{RefUnwindSafe, UnwindSafe},
     ptr,
     sync::atomic::{AtomicBool, AtomicIsize, Ordering},
@@ -139,7 +140,7 @@ fn initialize_inner(my_state: &AtomicIsize, offset: isize, init: &mut dyn FnMut(
     // SeqCst minimizes the chances of something going wrong.
     let mut state = my_state.load(Ordering::Relaxed);
 
-    'outer: loop {
+    loop {
         if state >= 0 {
             // If we're complete, then there's nothing to do, we just
             // jettison out as we shouldn't run the closure.
@@ -167,39 +168,53 @@ fn initialize_inner(my_state: &AtomicIsize, offset: isize, init: &mut dyn FnMut(
             }
             return;
         } else {
-            // All other values we find should correspond to the RUNNING
-            // state with an encoded waiter list in the more significant
-            // bits. We attempt to enqueue ourselves by moving us to the
-            // head of the list and bail out if we ever see a state that's
-            // not RUNNING.
-            assert!(state <= RUNNING);
-            let mut node = Waiter {
+            // Create the node for our current thread that we are going to try to slot
+            // in at the head of the linked list.
+            //
+            // We only drop our node if we didn't end up putting it in the queue.
+            // After it is enqueued, the thread that wakes us will have taken out `thread` and
+            // will take care of dropping it.
+            // So there is nothing to clean up after enqueueing this thread. Not dropping it then
+            // means there are no reads from an modified (now empty) `thread` field, and we don't
+            // have to do an `acquire` on `signaled`.
+            let mut node = ManuallyDrop::new(Waiter {
                 thread: Cell::new(Some(thread::current())),
                 signaled: AtomicBool::new(false),
                 next: ptr::null_mut(),
-            };
-            let me = -(((&node as *const Waiter as usize) >> 1) as isize);
+            });
+            let me = -(((&node as *const _ as usize) >> 1) as isize);
 
-            while state <= RUNNING {
+            // Try to slide in the node at the head of the linked list.
+            // Run in a loop where we make sure the status is still RUNNING, and that
+            // another thread did not just replace the head of the linked list.
+            loop {
+                if !(state <= RUNNING) {
+                    // No need anymore to enqueue ourselves.
+                    ManuallyDrop::into_inner(node); // drop
+                    return;
+                }
+
                 if state != RUNNING {
-                    // This is an encoded pointer
+                    // There already is a queue of waiters. Decode the pointer and add it as our
+                    // next.
                     node.next = (((-state) as usize) << 1) as *const Waiter;
                 }
                 let old = my_state.compare_and_swap(state, me, Ordering::Release);
-                if old != state {
-                    state = old;
-                    continue;
+                if old == state {
+                    break; // Success!
                 }
-
-                // Once we've enqueued ourselves, wait in a loop.
-                // Afterwards reload the state and continue with what we
-                // were doing from before.
-                while !node.signaled.load(Ordering::Acquire) {
-                    thread::park();
-                }
-                state = my_state.load(Ordering::Relaxed);
-                continue 'outer;
+                state = old;
             }
+
+            // We have enqueued ourselves, now lets wait.
+            // It is important not to return before being signaled, otherwise we would
+            // drop our `Waiter` node and leave a hole in the linked list (and a
+            // dangling reference). Guard against spurious wakeups by reparking
+            // ourselves until we are signaled.
+            while !node.signaled.load(Ordering::Relaxed) {
+                thread::park();
+            }
+            state = my_state.load(Ordering::Relaxed);
         }
     }
 }
@@ -222,6 +237,7 @@ impl Drop for Finish<'_> {
                     let next = (*queue).next;
                     let thread = (*queue).thread.take().unwrap();
                     (*queue).signaled.store(true, Ordering::Release);
+                    // `unpark` does an atomic operation that prevents it from getting reordered.
                     thread.unpark();
                     queue = next;
                 }
