@@ -4,7 +4,7 @@
 //   * init function can fail
 
 use std::{
-    cell::UnsafeCell,
+    cell::{Cell, UnsafeCell},
     marker::PhantomData,
     panic::{RefUnwindSafe, UnwindSafe},
     ptr,
@@ -21,7 +21,7 @@ pub(crate) struct OnceCell<T> {
     //       -2 RUNNING
     //     < -2 (encoded waiter pointer, -(waiterptr >> 1))
     state: AtomicIsize,
-    _marker: PhantomData<*mut Waiter>,
+    _marker: PhantomData<*const Waiter>,
     pub(crate) value: UnsafeCell<MaybeUninit<T>>,
 }
 
@@ -40,12 +40,17 @@ impl<T: UnwindSafe> UnwindSafe for OnceCell<T> {}
 const EMPTY: isize = -1;
 const RUNNING: isize = -2; // and less
 
-// Representation of a node in the linked list of waiters in the RUNNING state.
+// Representation of a node in the linked list of waiters, used while in the
+// RUNNING state.
+// Note: `Waiter` can't hold a mutable pointer to the next thread, because then
+// we would both hand out a mutable reference to its `Waiter` node, and keep a
+// shared reference to check `signaled`. Instead we use shared references and
+// interior mutability.
 #[repr(align(8))]
 struct Waiter {
-    thread: Option<Thread>,
+    thread: Cell<Option<Thread>>,
     signaled: AtomicBool,
-    next: *mut Waiter,
+    next: *const Waiter,
 }
 
 // Helper struct used to clean up after a closure call with a `Drop`
@@ -169,16 +174,16 @@ fn initialize_inner(my_state: &AtomicIsize, offset: isize, init: &mut dyn FnMut(
             // not RUNNING.
             assert!(state <= RUNNING);
             let mut node = Waiter {
-                thread: Some(thread::current()),
+                thread: Cell::new(Some(thread::current())),
                 signaled: AtomicBool::new(false),
                 next: ptr::null_mut(),
             };
-            let me = -(((&mut node as *mut Waiter as usize) >> 1) as isize);
+            let me = -(((&node as *const Waiter as usize) >> 1) as isize);
 
             while state <= RUNNING {
                 if state != RUNNING {
                     // This is an encoded pointer
-                    node.next = (((-state) as usize) << 1) as *mut Waiter;
+                    node.next = (((-state) as usize) << 1) as *const Waiter;
                 }
                 let old = my_state.compare_and_swap(state, me, Ordering::SeqCst);
                 if old != state {
@@ -212,7 +217,7 @@ impl Drop for Finish<'_> {
         // signal ahead of time and then unpark it after the store.
         unsafe {
             if queue != RUNNING {
-                let mut queue = ((-queue as usize) << 1) as *mut Waiter;
+                let mut queue = ((-queue as usize) << 1) as *const Waiter;
                 while !queue.is_null() {
                     let next = (*queue).next;
                     let thread = (*queue).thread.take().unwrap();
