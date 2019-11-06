@@ -5,19 +5,17 @@
 
 use std::{
     cell::UnsafeCell,
-    marker::PhantomData,
     panic::{RefUnwindSafe, UnwindSafe},
-    ptr,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    thread::{self, Thread},
+    sync::atomic::{AtomicUsize, Ordering},
 };
+
+use crate::thread_parker::{Futex, RESERVED_BITS, RESERVED_MASK};
 
 #[derive(Debug)]
 pub(crate) struct OnceCell<T> {
     // This `state` word is actually an encoded version of just a pointer to a
     // `Waiter`, so we add the `PhantomData` appropriately.
     state: AtomicUsize,
-    _marker: PhantomData<*mut Waiter>,
     // FIXME: switch to `std::mem::MaybeUninit` once we are ready to bump MSRV
     // that far. It was stabilized in 1.36.0, so, if you are reading this and
     // it's higher than 1.46.0 outside, please send a PR! ;) (and to the same
@@ -38,20 +36,9 @@ impl<T: UnwindSafe> UnwindSafe for OnceCell<T> {}
 
 // Three states that a OnceCell can be in, encoded into the lower bits of `state` in
 // the OnceCell structure.
-const INCOMPLETE: usize = 0x0;
-const RUNNING: usize = 0x1;
-const COMPLETE: usize = 0x2;
-
-// Mask to learn about the state. All other bits are the queue of waiters if
-// this is in the RUNNING state.
-const STATE_MASK: usize = 0x3;
-
-// Representation of a node in the linked list of waiters in the RUNNING state.
-struct Waiter {
-    thread: Option<Thread>,
-    signaled: AtomicBool,
-    next: *mut Waiter,
-}
+const INCOMPLETE: usize = 0 << RESERVED_BITS;
+const RUNNING: usize = 1 << RESERVED_BITS;
+const COMPLETE: usize = 2 << RESERVED_BITS;
 
 // Helper struct used to clean up after a closure call with a `Drop`
 // implementation to also run on panic.
@@ -64,7 +51,6 @@ impl<T> OnceCell<T> {
     pub(crate) const fn new() -> OnceCell<T> {
         OnceCell {
             state: AtomicUsize::new(INCOMPLETE),
-            _marker: PhantomData,
             value: UnsafeCell::new(None),
         }
     }
@@ -114,7 +100,7 @@ fn initialize_inner(my_state: &AtomicUsize, init: &mut dyn FnMut() -> bool) -> b
     // SeqCst minimizes the chances of something going wrong.
     let mut state = my_state.load(Ordering::SeqCst);
 
-    'outer: loop {
+    loop {
         match state {
             // If we're complete, then there's nothing to do, we just
             // jettison out as we shouldn't run the closure.
@@ -148,32 +134,9 @@ fn initialize_inner(my_state: &AtomicUsize, init: &mut dyn FnMut() -> bool) -> b
             // head of the list and bail out if we ever see a state that's
             // not RUNNING.
             _ => {
-                assert!(state & STATE_MASK == RUNNING);
-                let mut node = Waiter {
-                    thread: Some(thread::current()),
-                    signaled: AtomicBool::new(false),
-                    next: ptr::null_mut(),
-                };
-                let me = &mut node as *mut Waiter as usize;
-                assert!(me & STATE_MASK == 0);
-
-                while state & STATE_MASK == RUNNING {
-                    node.next = (state & !STATE_MASK) as *mut Waiter;
-                    let old = my_state.compare_and_swap(state, me | RUNNING, Ordering::SeqCst);
-                    if old != state {
-                        state = old;
-                        continue;
-                    }
-
-                    // Once we've enqueued ourselves, wait in a loop.
-                    // Afterwards reload the state and continue with what we
-                    // were doing from before.
-                    while !node.signaled.load(Ordering::SeqCst) {
-                        thread::park();
-                    }
-                    state = my_state.load(Ordering::SeqCst);
-                    continue 'outer;
-                }
+                assert!(state & !RESERVED_MASK == RUNNING);
+                unsafe { my_state.park(|s| { s == RUNNING }); }
+                state = my_state.load(Ordering::SeqCst);
             }
         }
     }
@@ -183,28 +146,13 @@ impl Drop for Finish<'_> {
     fn drop(&mut self) {
         // Swap out our state with however we finished. We should only ever see
         // an old state which was RUNNING.
-        let queue = if self.failed {
+        let state = if self.failed {
             // Difference from std: flip back to INCOMPLETE rather than POISONED.
-            self.my_state.swap(INCOMPLETE, Ordering::SeqCst)
+            INCOMPLETE
         } else {
-            self.my_state.swap(COMPLETE, Ordering::SeqCst)
+            COMPLETE
         };
-        assert_eq!(queue & STATE_MASK, RUNNING);
-
-        // Decode the RUNNING to a list of waiters, then walk that entire list
-        // and wake them up. Note that it is crucial that after we store `true`
-        // in the node it can be free'd! As a result we load the `thread` to
-        // signal ahead of time and then unpark it after the store.
-        unsafe {
-            let mut queue = (queue & !STATE_MASK) as *mut Waiter;
-            while !queue.is_null() {
-                let next = (*queue).next;
-                let thread = (*queue).thread.take().unwrap();
-                (*queue).signaled.store(true, Ordering::SeqCst);
-                thread.unpark();
-                queue = next;
-            }
-        }
+        unsafe { self.my_state.store_and_unpark(state) }
     }
 }
 

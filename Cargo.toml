@@ -31,6 +31,9 @@ default = ["std"]
 # Enables `once_cell::sync` module.
 std = []
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.55"
+
 [[example]]
 name = "bench"
 required-features = ["std"]
