@@ -12,11 +12,15 @@ mod posix;
 #[cfg(any(target_os = "redox"))]
 mod redox;
 
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+mod wasm_atomic;
+
 #[cfg(not(any(unix,
               target_os = "linux",
               target_os = "android",
-              target_os = "redox"
-)))]
+              target_os = "redox",
+              all(target_arch = "wasm32", target_feature = "atomics")
+    )))]
 mod spin_loop;
 
 pub trait Futex {
