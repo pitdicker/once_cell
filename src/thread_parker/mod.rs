@@ -9,7 +9,11 @@ mod windows;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux;
 
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+#[cfg(target_os = "freebsd")]
+mod freebsd;
+
+#[cfg(all(unix,
+          not(any(target_os = "linux", target_os = "android", target_os = "freebsd"))))]
 mod posix;
 
 #[cfg(any(target_os = "redox"))]
@@ -21,6 +25,7 @@ mod wasm_atomic;
 #[cfg(not(any(windows,
               unix,
               target_os = "linux",
+              target_os = "freebsd",
               target_os = "android",
               target_os = "redox",
               all(target_arch = "wasm32", target_feature = "atomics")
