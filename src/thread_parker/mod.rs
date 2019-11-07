@@ -3,6 +3,9 @@ use std::{
     sync::atomic::{AtomicUsize},
 };
 
+#[cfg(windows)]
+mod windows;
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux;
 
@@ -15,7 +18,8 @@ mod redox;
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 mod wasm_atomic;
 
-#[cfg(not(any(unix,
+#[cfg(not(any(windows,
+              unix,
               target_os = "linux",
               target_os = "android",
               target_os = "redox",
