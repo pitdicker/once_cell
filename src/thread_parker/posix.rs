@@ -3,7 +3,7 @@ use core::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use crate::thread_parker::{ThreadParking, ParkerWithState};
+use crate::thread_parker::{Futex, ParkerWithState, FREE_BITS, RESERVED_MASK};
 
 #[repr(align(8))] // Leave the three lower bits are free to use for other purposes.
 struct Waiter {
@@ -12,7 +12,7 @@ struct Waiter {
 }
 
 impl Futex for AtomicUsize {
-    unsafe fn park<P, E>(&self, should_park: P)
+    unsafe fn park<P>(&self, should_park: P)
     where
         P: Fn(usize) -> bool
     {
@@ -50,7 +50,7 @@ impl Futex for AtomicUsize {
         let mut next = ((queue & RESERVED_MASK) << FREE_BITS) as *const Waiter;
         while !next.is_null() {
             let current = next;
-            next = decode_ptr((*current).next) as *const Waiter;
+            next = (((*current).next & RESERVED_MASK) << FREE_BITS) as *const Waiter;
             (*current).parker.unpark();
         }
     }

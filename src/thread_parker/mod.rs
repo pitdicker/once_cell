@@ -9,6 +9,9 @@ mod linux;
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
 mod posix;
 
+#[cfg(any(target_os = "redox"))]
+mod redox;
+
 pub trait Futex {
     // Park the current thread if `should_park` returns `true`. Reparks after a spurious wakeup.
     //
