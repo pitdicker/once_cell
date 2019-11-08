@@ -1,3 +1,9 @@
+// TODO:
+// Fuchsia: https://fuchsia.dev/fuchsia-src/concepts/objects/futex
+//          https://docs.rs/fuchsia-zircon-sys/0.3.3/fuchsia_zircon_sys/fn.zx_futex_wait.html
+// OpenBSD: futex
+// SGX: ...
+
 use std::{
     mem,
     sync::atomic::{AtomicUsize},
