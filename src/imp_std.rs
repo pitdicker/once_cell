@@ -9,7 +9,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use crate::thread_parker::{Futex, RESERVED_BITS, RESERVED_MASK};
+use valet_parking::{Waiters, RESERVED_BITS, RESERVED_MASK};
 
 #[derive(Debug)]
 pub(crate) struct OnceCell<T> {
@@ -135,7 +135,7 @@ fn initialize_inner(my_state: &AtomicUsize, init: &mut dyn FnMut() -> bool) -> b
             // not RUNNING.
             _ => {
                 assert!(state & !RESERVED_MASK == RUNNING);
-                unsafe { my_state.park(|s| { s == RUNNING }); }
+                my_state.compare_and_wait(RUNNING);
                 state = my_state.load(Ordering::SeqCst);
             }
         }
@@ -152,7 +152,7 @@ impl Drop for Finish<'_> {
         } else {
             COMPLETE
         };
-        unsafe { self.my_state.store_and_unpark(state) }
+        unsafe { self.my_state.store_and_wake(state) }
     }
 }
 

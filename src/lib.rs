@@ -233,8 +233,6 @@ mod imp;
 #[path = "imp_std.rs"]
 mod imp;
 
-mod thread_parker;
-
 pub mod unsync {
     use core::{
         cell::{Cell, UnsafeCell},
